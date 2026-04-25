@@ -1,0 +1,714 @@
+---
+title: "How Does Family Involvement Influence Student Academic Performance?"
+subtitle: "Classification Project"
+author: "Eric Mulaa, Andrew Wanyeki, Gideon Dennis"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Loading Data and Necessary Packages.
+
+```{r libraries}
+library(tidyverse)
+library(tidymodels)
+library(readxl)
+library(discrim)
+library(nnet)
+library(glmnet)
+library(vip)
+library(broom)
+library(kableExtra)
+library(patchwork)
+library(forcats)
+library(themis)
+library(poissonreg)
+```
+
+We begin by importing the curated 2019 PFI dataset and inspecting its structure. 
+
+```{r}
+pfi_data <- read_excel("~/STA 631 01/projects/pfi-data.xlsx", sheet = "curated 2019")
+dim(pfi_data)
+names(pfi_data)
+glimpse(pfi_data)
+```
+
+## Research Question
+
+This project examines how family involvement at school and at home is associated with student academic performance in the 2019 Parent and Family Involvement (PFI) survey. Academic performance is measured using `SEGRADES`, the parent-reported overall grades item. Family involvement is measured using school-based involvement items, contact with the school, and homework/home-engagement variables.
+
+## Select Variables + Response (SEGRADES)
+
+```{r}
+pfi_clean <- pfi_data %>%
+  mutate(across(where(is.numeric), ~ ifelse(. < 0, NA, .))) %>%
+  select(
+    BASMID,
+    SEGRADES, SEENJOY, SEABSNT, SEGRADEQ,
+    FSSPORTX, FSVOL, FSMTNG, FSPTMTNG, FSATCNFN, FSFUNDRS, FSCOMMTE, FSCOUNSLR, FSFREQ,
+    FSNOTESX, FSMEMO,
+    FHHOME, FHWKHRS, FHAMOUNT, FHCAMT, FODINNERX,
+    EDCPUB, SCCHOICE, SCONSIDR, SPUBCHOIX,
+    ALLGRADEX, PARGRADEX, TTLHHINC, RACEETH,
+    CSEX, DSBLTY, HHPARN19_BRD, OWNRNTHB, CENREG,
+    HHTOTALXX, NUMSIBSX, P1AGE, P1EMPL, INTACC, ZIPLOCL
+  ) %>%
+  mutate(
+    SEGRADES = ifelse(SEGRADES == 5, NA, SEGRADES),
+    grade_multi = factor(
+      SEGRADES,
+      levels = c(1, 2, 3, 4),
+      labels = c("Mostly_A", "Mostly_B", "Mostly_C", "Mostly_D_or_lower")
+    ),
+    high_achiever = factor(
+      ifelse(SEGRADES == 1, "Yes", "No"),
+      levels = c("Yes", "No")
+    )
+  )
+
+```
+
+## Lets check for missingness
+
+```{r}
+missingness_table <- pfi_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(percent_missing = round(100 * n_missing / nrow(pfi_clean), 1)) %>%
+  arrange(desc(percent_missing))
+
+```
+
+```{r}
+missingness_table %>%
+  slice_head(n = 20) %>%
+  kbl(caption = "Top 20 Variables by Missingness") %>%
+  kable_classic(full_width = FALSE)
+  
+```
+
+
+```{r}
+pfi_model <- pfi_clean %>%
+  filter(
+    !is.na(grade_multi),
+    !is.na(high_achiever),
+    !is.na(PARGRADEX),
+    !is.na(TTLHHINC),
+    !is.na(RACEETH),
+    !is.na(CSEX)
+  )
+dim(pfi_model)
+```
+
+## Lets add composite family-involvement variables
+
+The questionnaire confirms those `FS*` variables are all school-based family involvement items, and `FSFREQ` is the count of how many times an adult in the household went to meetings or activities at the child’s school.
+
+```{r}
+pfi_model <- pfi_model %>%
+  mutate(
+    across(
+      c(FSSPORTX, FSVOL, FSMTNG, FSPTMTNG, FSATCNFN, FSFUNDRS, FSCOMMTE, FSCOUNSLR,
+        FSNOTESX, FSMEMO),
+      ~ case_when(
+        . == 1 ~ 1,
+        . == 2 ~ 0,
+        TRUE ~ NA_real_
+      )
+    ),
+    school_involve_score = rowSums(
+      select(., FSSPORTX, FSVOL, FSMTNG, FSPTMTNG, FSATCNFN, FSFUNDRS, FSCOMMTE, FSCOUNSLR),
+      na.rm = TRUE
+    ),
+    school_contact_score = rowSums(
+      select(., FSNOTESX, FSMEMO),
+      na.rm = TRUE
+    )
+  )
+```
+
+```{r}
+pfi_model <- pfi_model %>%
+  mutate(
+    CSEX = factor(CSEX, levels = c(1, 2), labels = c("Male", "Female")),
+    RACEETH = factor(RACEETH, levels = c(1, 2, 3, 4, 5),
+                     labels = c("White", "Black", "Hispanic", "Asian_PI", "Other")),
+    PARGRADEX = factor(PARGRADEX,
+                       labels = c("Less_than_HS", "HS", "Associate", "Bachelors", "Graduate")),
+    TTLHHINC = factor(TTLHHINC, ordered = TRUE),
+    EDCPUB = factor(EDCPUB),
+    SCCHOICE = factor(SCCHOICE),
+    SCONSIDR = factor(SCONSIDR),
+    SPUBCHOIX = factor(SPUBCHOIX),
+    DSBLTY = factor(DSBLTY),
+    HHPARN19_BRD = factor(HHPARN19_BRD),
+    OWNRNTHB = factor(OWNRNTHB),
+    CENREG = factor(CENREG),
+    P1EMPL = factor(P1EMPL),
+    INTACC = factor(INTACC),
+    ZIPLOCL = factor(ZIPLOCL),
+    SEENJOY = factor(SEENJOY, ordered = TRUE),
+    SEABSNT = factor(SEABSNT, ordered = TRUE)
+  )
+```
+
+# Exploratory Data Analysis
+
+```{r}
+ggplot(pfi_model, aes(x = grade_multi)) +
+  geom_bar(fill = "#2C7FB8") +
+  labs(
+    title = "Distribution of Student Grades",
+    x = "SEGRADES",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+```
+
+The distribution of SEGRADES shows a strong imbalance, with most students reporting mostly A’s or B’s and relatively few reporting lower grades. This imbalance is important for model selection and evaluation.
+
+```{r}
+ggplot(pfi_model, aes(x = grade_multi, y = school_involve_score)) +
+  geom_boxplot(fill = "#A6CEE3") +
+  labs(
+    title = "School Involvement Score by Student Grades",
+    x = "SEGRADES",
+    y = "School Involvement Score"
+  ) +
+  theme_minimal()
+```
+
+School involvement scores do not show a strong positive relationship with higher academic performance; in fact, students with lower grades often have similar or slightly higher involvement levels, suggesting that involvement may be reactive rather than preventative.
+
+```{r}
+ggplot(pfi_model, aes(x = grade_multi, y = FSFREQ)) +
+  geom_boxplot(fill = "#B2DF8A") +
+  labs(
+    title = "Frequency of School Meetings/Activities by Student Grades",
+    x = "SEGRADES",
+    y = "FSFREQ"
+  ) +
+  theme_minimal()
+```
+
+The frequency of school meetings and activities shows a weak positive association with academic performance, but the large variability and presence of extreme values suggest that this relationship is not strong and that the distribution is highly skewed.
+
+```{r}
+ggplot(pfi_model, aes(x = FHHOME, fill = grade_multi)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Grade Distribution by Homework Frequency",
+    x = "How often homework is done outside school",
+    y = "Proportion"
+  ) +
+  theme_minimal()
+```
+
+Homework frequency shows a clear positive relationship with academic performance, with higher frequencies associated with a larger proportion of students receiving mostly A’s. This suggests that home-based engagement may be a stronger predictor of academic success than school-based involvement.
+
+# Data splitting for modeling
+
+```{r}
+set.seed(631)
+
+class_df <- pfi_model %>%
+  select(
+    high_achiever, grade_multi, SEGRADES,
+    school_involve_score, school_contact_score, FSFREQ,
+    FHHOME, FHWKHRS, FHAMOUNT, FHCAMT, FODINNERX,
+    SEENJOY, SEABSNT,
+    EDCPUB, SCCHOICE, SCONSIDR, SPUBCHOIX,
+    PARGRADEX, TTLHHINC, RACEETH, CSEX, DSBLTY,
+    HHPARN19_BRD, OWNRNTHB, CENREG, HHTOTALXX, NUMSIBSX, P1AGE, P1EMPL, INTACC, ZIPLOCL
+  ) %>%
+  drop_na()
+
+class_split <- initial_split(class_df, prop = 0.75, strata = high_achiever)
+class_train <- training(class_split)
+class_test  <- testing(class_split)
+```
+
+```{r}
+set.seed(631)
+class_folds <- vfold_cv(class_train, v = 10, strata = high_achiever)
+
+count_df <- pfi_model %>%
+  select(
+    FSFREQ,
+    school_involve_score, school_contact_score,
+    FHHOME, FHWKHRS, FODINNERX,
+    PARGRADEX, TTLHHINC, RACEETH, CSEX, DSBLTY,
+    SCCHOICE, EDCPUB
+  ) %>%
+  drop_na()
+
+count_split <- initial_split(count_df, prop = 0.75)
+count_train <- training(count_split)
+count_test  <- testing(count_split)
+```
+
+
+```{r}
+multi_df <- class_df %>%
+  select(
+    grade_multi,
+    school_involve_score, school_contact_score, FSFREQ,
+    FHHOME, FHWKHRS, FODINNERX, SEENJOY, SEABSNT,
+    SCCHOICE, EDCPUB, PARGRADEX, TTLHHINC, RACEETH, CSEX, DSBLTY
+  ) %>%
+  drop_na()
+
+set.seed(631)
+multi_split <- initial_split(multi_df, prop = 0.75, strata = grade_multi)
+
+multi_train <- training(multi_split)
+multi_test  <- testing(multi_split)
+```
+
+
+# Lasso Regression
+
+```{r}
+lasso_recipe <- recipe(high_achiever ~ ., data = class_train) %>%
+  step_rm(grade_multi, SEGRADES) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+```{r}
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+lasso_wf <- workflow() %>%
+  add_recipe(lasso_recipe) %>%
+  add_model(lasso_spec)
+
+lambda_grid <- grid_regular(penalty(), levels = 40)
+
+set.seed(631)
+lasso_res <- tune_grid(
+  lasso_wf,
+  resamples = class_folds,
+  grid = lambda_grid,
+  metrics = metric_set(roc_auc, accuracy),
+  control = control_grid(save_pred = TRUE)
+)
+```
+
+```{r lasso-plot}
+collect_metrics(lasso_res) %>%
+  ggplot(aes(x = penalty, y = mean, color = .metric)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ .metric, scales = "free_y", ncol = 1) +
+  scale_x_log10() +
+  theme_minimal() +
+  labs(title = "Lasso Tuning Results", x = "Penalty", y = "Cross-validated performance")
+```
+
+```{r lasso-final}
+best_penalty <- select_best(lasso_res, metric = "roc_auc")
+
+final_lasso_wf <- finalize_workflow(lasso_wf, best_penalty)
+
+lasso_last_fit <- last_fit(final_lasso_wf, class_split)
+
+lasso_preds <- collect_predictions(lasso_last_fit)
+collect_metrics(lasso_last_fit)
+```
+
+The lasso logistic model achieved an accuracy of 71.5% and an ROC AUC of 0.773 on the test set, indicating moderate predictive ability in distinguishing high-achieving students from others. Performance remained stable across small penalty values but declined sharply at larger penalties, suggesting that overly aggressive regularization removed too much predictive information.
+
+```{r lasso-importance}
+final_lasso_fit <- fit(final_lasso_wf, data = class_train)
+
+lasso_coefs <- final_lasso_fit %>%
+  extract_fit_parsnip() %>%
+  tidy()
+
+lasso_coefs_nonzero <- lasso_coefs %>%
+  filter(term != "(Intercept)", estimate != 0) %>%
+  arrange(desc(abs(estimate)))
+
+lasso_coefs_nonzero %>%
+  slice_head(n = 20) %>%
+  knitr::kable(caption = "Top Lasso-Selected Predictors")
+```
+
+The lasso model selected a relatively small set of predictors, indicating that only a subset of the available family, school, and demographic variables contributed meaningful predictive information. Among the retained predictors, student school experience variables such as school enjoyment and absenteeism, along with household background characteristics such as parental education, income, disability status, and demographic factors, showed the strongest effects. Importantly for the research question, home-based involvement variables such as homework-related engagement (FHHOME, FHCAMT) remained in the model, while school contact was retained with a smaller coefficient. This suggests that family involvement at home may be more strongly associated with academic performance than school-based involvement, although broader student and household characteristics also play a major role.
+
+race/ethnicity remained in the selected model, indicating differences in predicted academic performance across groups after accounting for other retained covariates.
+
+## Confusion Matrix for lasso:
+
+```{r lasso-confusion}
+lasso_preds %>%
+  conf_mat(truth = high_achiever, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title = "Lasso Confusion Matrix")
+
+```
+
+# Standard Logistic Regression Model
+
+```{r logistic-model}
+log_formula <- high_achiever ~ school_involve_score + school_contact_score + FSFREQ +
+  FHHOME + FHWKHRS + FODINNERX + SEENJOY + SEABSNT +
+  SCCHOICE + EDCPUB + PARGRADEX + TTLHHINC + RACEETH + CSEX + DSBLTY
+
+log_recipe <- recipe(log_formula, data = class_train) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+log_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_wf <- workflow() %>%
+  add_recipe(log_recipe) %>%
+  add_model(log_spec)
+
+log_last_fit <- last_fit(log_wf, class_split)
+log_preds <- collect_predictions(log_last_fit)
+
+collect_metrics(log_last_fit)
+```
+
+The standard logistic regression model achieved an accuracy of 70.8%, an ROC AUC of 0.769, and a Brier score of 0.193 on the test set. These results were very similar to the lasso logistic model, though the lasso model performed slightly better on all three metrics. This indicates that reducing the predictor set through regularization did not harm predictive performance and may have improved out-of-sample generalization. Because the lasso model is also more parsimonious, it provides a strong candidate for the preferred binary classification model
+
+```{r logistic-metrics}
+metric_set(accuracy, precision, recall, f_meas, roc_auc)(
+  log_preds,
+  truth = high_achiever,
+  estimate = .pred_class,
+  .pred_Yes
+)
+```
+
+The higher recall relative to precision suggests that the model is better at identifying true positive cases than at avoiding false positive classifications.
+
+```{r logistic-odds}
+log_fit_object <- fit(log_wf, data = class_train)
+
+tidy(extract_fit_parsnip(log_fit_object), conf.int = TRUE, exponentiate = TRUE) %>%
+  kbl(caption = "Logistic Regression Odds Ratios") %>%
+  kable_classic(full_width = FALSE)
+```
+
+## Confusion Matrix for logistic:
+
+```{r logistic-confusion}
+log_preds %>%
+  conf_mat(truth = high_achiever, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title = "Logistic Regression Confusion Matrix")
+```
+
+```{r logistic-roc}
+log_preds %>%
+  roc_curve(truth = high_achiever, .pred_Yes) %>%
+  autoplot() +
+  labs(title = "Logistic Regression ROC Curve")
+```
+
+# Multinomial Model
+
+```{r multinomial-model}
+
+multi_recipe <- recipe(grade_multi ~ ., data = multi_train) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+multi_spec <- multinom_reg() %>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+
+multi_wf <- workflow() %>%
+  add_recipe(multi_recipe) %>%
+  add_model(multi_spec)
+
+multi_last_fit <- last_fit(multi_wf, multi_split)
+
+collect_metrics(multi_last_fit)
+```
+
+The multinomial model is harder to fit well than the binary models, but it is the more appropriate model for the full SEGRADES response because it preserves all four academic-performance categories instead of collapsing them into a yes/no outcome.
+
+## Multinomial Confusion Matrix
+
+```{r}
+multi_preds <- collect_predictions(multi_last_fit)
+
+multi_cm <- multi_preds %>%
+  conf_mat(truth = grade_multi, estimate = .pred_class)
+
+multi_cm
+
+autoplot(multi_cm, type = "heatmap") +
+  labs(title = "Multinomial Regression Confusion Matrix")
+```
+The multinomial confusion matrix shows that the model performs best on the more common A and B categories and struggles more with the less common C and D-or-lower categories, which is consistent with the class imbalance observed in the outcome distribution.
+
+# Linear and Quadratic Discriminant Analysis
+
+```{r}
+disc_recipe <- recipe(
+  high_achiever ~ school_involve_score + school_contact_score + FSFREQ +
+    FHWKHRS + FODINNERX + P1AGE + HHTOTALXX + NUMSIBSX,
+  data = class_train
+) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors())
+
+lda_spec <- discrim_linear() %>%
+  set_engine("MASS") %>%
+  set_mode("classification")
+
+qda_spec <- discrim_quad() %>%
+  set_engine("MASS") %>%
+  set_mode("classification")
+
+lda_wf <- workflow() %>% add_recipe(disc_recipe) %>% add_model(lda_spec)
+qda_wf <- workflow() %>% add_recipe(disc_recipe) %>% add_model(qda_spec)
+
+lda_fit <- last_fit(lda_wf, class_split)
+qda_fit <- last_fit(qda_wf, class_split)
+
+collect_metrics(lda_fit)
+collect_metrics(qda_fit)
+```
+
+## Confusion matrix for lda
+
+```{r}
+lda_preds <- collect_predictions(lda_fit)
+
+# Confusion matrix
+lda_preds %>%
+  conf_mat(truth = high_achiever, estimate = .pred_class)
+
+# Heatmap
+lda_preds %>%
+  conf_mat(truth = high_achiever, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+## Confusion matrix for qda
+
+```{r}
+qda_preds <- collect_predictions(qda_fit)
+
+qda_preds %>%
+  conf_mat(truth = high_achiever, estimate = .pred_class)
+
+qda_preds %>%
+  conf_mat(truth = high_achiever, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+```{r}
+metric_set(accuracy, precision, recall, f_meas, roc_auc)(
+  lda_preds,
+  truth = high_achiever,
+  estimate = .pred_class,
+  .pred_Yes
+)
+```
+
+```{r}
+metric_set(accuracy, precision, recall, f_meas, roc_auc)(
+  qda_preds,
+  truth = high_achiever,
+  estimate = .pred_class,
+  .pred_Yes
+)
+```
+
+Linear Discriminant Analysis (LDA) and Quadratic Discriminant Analysis (QDA) were fit as alternative binary classifiers for high academic achievement. LDA achieved 60.7% accuracy, 88.5% recall, and an ROC AUC of 0.617, while QDA achieved 62.4% accuracy, 77.3% recall, and an ROC AUC of 0.648. LDA showed the highest recall, indicating that it was more aggressive in identifying positive cases, but this came at the cost of lower precision and weaker overall discrimination. 
+
+QDA performed slightly better than LDA in accuracy, precision, and AUC, suggesting that allowing quadratic decision boundaries improved classification somewhat. However, both discriminant-analysis methods underperformed compared with the logistic and lasso logistic models, indicating that logistic-based approaches were better suited to this dataset.
+
+# Poisson Regression Model
+
+Since `FSFREQ` is literally a count of how many times adults in the household went to meetings or activities at the child’s school, it is an excellent Poisson outcome.
+
+```{r poisson-eda}
+count_train %>%
+  summarise(
+    mean_fsfreq = mean(FSFREQ),
+    var_fsfreq = var(FSFREQ),
+    ratio = var(FSFREQ) / mean(FSFREQ)
+  ) %>%
+  kbl(caption = "Poisson Dispersion Check for FSFREQ") %>%
+  kable_classic(full_width = FALSE)
+
+```
+
+If variance is much larger than the mean, we will note overdispersion. This will mean Poisson was demonstrated but may not fit perfectly.
+
+```{r poisson-model}
+pois_recipe <- recipe(
+  FSFREQ ~ school_involve_score + school_contact_score + FHHOME + FHWKHRS +
+    FODINNERX + PARGRADEX + TTLHHINC + RACEETH + CSEX + DSBLTY + SCCHOICE + EDCPUB,
+  data = count_train
+) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+pois_spec <- poisson_reg() %>%
+  set_engine("glm") %>%
+  set_mode("regression")
+
+pois_wf <- workflow() %>%
+  add_recipe(pois_recipe) %>%
+  add_model(pois_spec)
+
+pois_fit <- fit(pois_wf, data = count_train)
+
+pois_preds <- predict(pois_fit, new_data = count_test) %>%
+  bind_cols(count_test)
+
+rmse(pois_preds, truth = FSFREQ, estimate = .pred)
+```
+
+The Poisson regression model was used to analyze FSFREQ, the number of times adults in the household attended meetings or activities at the child’s school. However, the dispersion check indicated substantial overdispersion: the mean of FSFREQ was 7.19, while the variance was 92.28, yielding a variance-to-mean ratio of 12.83. Because the Poisson model assumes equality of the mean and variance, this result indicates a serious violation of the Poisson assumption. The test-set RMSE of 8.53 was also large relative to the mean count, suggesting weak predictive accuracy. Therefore, while Poisson regression was demonstrated as required, it was not considered the preferred model for this count outcome.
+
+# Binary Model Comparison Table
+
+```{r model-comparison}
+lasso_metrics <- metric_set(accuracy, precision, recall, f_meas, roc_auc)(
+  lasso_preds, truth = high_achiever, estimate = .pred_class, .pred_Yes
+) %>%
+  select(.metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  mutate(model = "Lasso Logistic")
+
+log_metrics <- metric_set(accuracy, precision, recall, f_meas, roc_auc)(
+  log_preds, truth = high_achiever, estimate = .pred_class, .pred_Yes
+) %>%
+  select(.metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  mutate(model = "Standard Logistic")
+
+lda_preds <- collect_predictions(lda_fit)
+lda_metrics <- metric_set(accuracy, roc_auc)(
+  lda_preds, truth = high_achiever, estimate = .pred_class, .pred_Yes
+) %>%
+  select(.metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  mutate(model = "LDA")
+
+qda_preds <- collect_predictions(qda_fit)
+qda_metrics <- metric_set(accuracy, roc_auc)(
+  qda_preds, truth = high_achiever, estimate = .pred_class, .pred_Yes
+) %>%
+  select(.metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  mutate(model = "QDA")
+
+bind_rows(lasso_metrics, log_metrics, lda_metrics, qda_metrics) %>%
+  select(model, everything()) %>%
+  kbl(caption = "Binary Classification Model Comparison") %>%
+  kable_classic(full_width = FALSE)
+
+```
+
+# All-model comparison table
+
+```{r}
+lasso_summary <- tibble(
+  model = "Lasso Logistic",
+  outcome = "high_achiever",
+  accuracy = 0.7149123,
+  roc_auc = 0.7734983,
+  comment = "Best binary model"
+)
+
+log_summary <- tibble(
+  model = "Standard Logistic",
+  outcome = "high_achiever",
+  accuracy = 0.7077068,
+  roc_auc = 0.7688812,
+  comment = "Close second"
+)
+
+lda_summary <- tibble(
+  model = "LDA",
+  outcome = "high_achiever",
+  accuracy = 0.6074561,
+  roc_auc = 0.6173456,
+  comment = "High recall, weak AUC"
+)
+
+qda_summary <- tibble(
+  model = "QDA",
+  outcome = "high_achiever",
+  accuracy = 0.6240602,
+  roc_auc = 0.6480891,
+  comment = "Better than LDA, below logistic"
+)
+
+multi_summary <- tibble(
+  model = "Multinomial Regression",
+  outcome = "grade_multi",
+  accuracy = 0.6237469,
+  roc_auc = 0.7119616,
+  comment = "Best full-outcome model"
+)
+
+pois_summary <- tibble(
+  model = "Poisson Regression",
+  outcome = "FSFREQ",
+  accuracy = NA_real_,
+  roc_auc = NA_real_,
+  comment = "Rejected due to overdispersion; RMSE = 8.53"
+)
+
+bind_rows(
+  lasso_summary, log_summary, multi_summary,
+  lda_summary, qda_summary, pois_summary
+) %>%
+  kbl(
+    caption = "Model Comparison Summary",
+    digits = 3
+  ) %>%
+  kable_classic(full_width = FALSE)
+
+```
+
+-   Because the grade-based outcomes are imbalanced, ROC AUC is emphasized more heavily than confusion-matrix accuracy when identifying the best classification models. Accuracy is still reported for completeness, but it can be misleading when most observations belong to the majority classes.
+
+-   The lasso model was used as a variable-selection tool to identify the most important family involvement, school contact, and demographic predictors of high academic achievement. Because lasso shrinks weak coefficients to zero, it provides a parsimonious starting point for final model interpretation.
+
+-   The standard logistic model provides interpretable odds ratios. Predictors with odds ratios greater than 1 are associated with higher odds of being a high achiever, holding other variables constant.
+
+-   The multinomial model is the most direct model for the original `SEGRADES` response because it preserves all four academic performance categories rather than collapsing them into a binary outcome.
+
+-   Poisson regression was used to model the count outcome `FSFREQ`, the number of times adults in the household attended meetings or activities at the child’s school. This demonstrates the required count-modeling component of the project while remaining substantively tied to family involvement.
+
+# Preferred Models
+
+Because the binary outcome `high_achiever` is imbalanced, model comparison emphasized ROC AUC in addition to confusion-matrix-based accuracy. Among the binary classifiers, the lasso logistic model is preferred because it achieved the strongest overall discrimination while also producing a more parsimonious set of predictors. The standard logistic model performed similarly and remains useful for interpretation, but lasso had a slight edge in predictive performance. For the original four-category `SEGRADES` outcome, the multinomial regression model is preferred because it preserves the full academic-performance structure rather than collapsing the response into a binary indicator. LDA and QDA were useful benchmark methods, but both underperformed relative to the logistic-based models. Poisson regression was demonstrated for the count outcome `FSFREQ`, but it was not retained as a preferred model because strong overdispersion indicated poor fit.
+
+# Limitations
+
+This analysis used a curated PFI analytic file and unweighted tidymodels workflows. The NHES:2019 Parent and Family Involvement survey is a complex national survey with weighting, nonresponse adjustment, and imputation procedures, so these results should be interpreted as associations within the analytic sample rather than fully survey-weighted national estimates. In addition, because the data are observational and cross-sectional, the models identify predictive associations rather than causal effects. For example, higher school involvement may reflect reactive engagement when a student is already struggling, rather than a direct causal improvement in grades.
+
+# Recommendations for GVSU’s K-12 Connect
+
+Across the exploratory analysis and the fitted models, home-based family engagement showed a clearer and more consistent relationship with academic performance than school-based involvement measures. In particular, homework-related engagement variables remained important in both the lasso-selected and regression-based models, whereas school event participation showed weaker and less consistent effects. Based on these findings, GVSU’s K-12 Connect should prioritize programs that help families build effective homework routines, maintain regular academic support at home, and strengthen day-to-day engagement with children’s schoolwork. School-based family involvement should still be encouraged, but the results suggest it may be more reactive than predictive when considered on its own.
