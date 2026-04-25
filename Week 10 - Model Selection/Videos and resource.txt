@@ -1,0 +1,3 @@
+PCA and PLS - https://cran.r-project.org/web/packages/pls/vignettes/pls-manual.html
+Variable Selection Methods - https://cran.r-project.org/web/packages/olsrr/vignettes/variable_selection.html
+Introduction and Best Subset Selection - https://www.youtube.com/watch?v=nsv5rEV3mVI&list=PLoROMvodv4rOzrYsAxzQyHb8n_RWNuS1e&index=36

@@ -1,0 +1,4 @@
+R Cheatsheet - https://opensource.posit.co/resources/cheatsheets/
+Tidy Modelling with R - https://www.tmwr.org/
+R for Data Science - https://r4ds.hadley.nz/
+Youtube Channel - https://www.youtube.com/@datascienceanalytics1826/videos
